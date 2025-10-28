@@ -38,7 +38,7 @@ TZ_ABBREV_TO_IANA = {
     "MDT": "America/Denver",
     "PST": "America/Los_Angeles",
     "PDT": "America/Los_Angeles",
-    # Some WQP exports use numeric UTC offsets like "-05:00"; let pandas handle those.
+    # Some WQP exports use numeric UTC offsets like "-05:00"; pandas can localize with these too.
 }
 
 # Defaults for "invalid" ResultStatusIdentifier
@@ -79,12 +79,20 @@ def to_bytes_csv(df: pd.DataFrame) -> bytes:
 
 def stable_hash_row(row: pd.Series) -> str:
     m = hashlib.md5()
-    # Convert to pipe-joined string for stability
     m.update("|".join([str(x) if pd.notna(x) else "" for x in row]).encode("utf-8"))
     return m.hexdigest()
 
 def has_cols(df: pd.DataFrame, cols: List[str]) -> bool:
     return all(c in df.columns for c in cols)
+
+def show_df(df: pd.DataFrame, height: int = 320):
+    """Unified dataframe display that uses the new Streamlit width API."""
+    st.dataframe(df, width="stretch", height=height)
+
+def warn_missing(*cols: str):
+    missing = [c for c in cols if c not in st.session_state["df_original"].columns]
+    if missing:
+        st.info(f"Note: missing column(s): {', '.join(missing)}")
 
 # ----------------------------
 # Cached Core Steps
@@ -107,8 +115,12 @@ def read_csv(file: io.BytesIO) -> pd.DataFrame:
         try:
             return pd.read_csv(file, engine="python", **base_kwargs)
         except Exception:
-            # Fallback to extremely safe mode (minimal args)
-            return pd.read_csv(file, engine="python", encoding_errors="ignore")
+            # Last resort: be very permissive about encodings
+            try:
+                return pd.read_csv(file, engine="python", encoding_errors="ignore")
+            except TypeError:
+                # Older pandas without encoding_errors
+                return pd.read_csv(file, engine="python")
 
 @st.cache_data(show_spinner=False)
 def schema_summary(df: pd.DataFrame) -> pd.DataFrame:
@@ -145,59 +157,51 @@ def schema_summary(df: pd.DataFrame) -> pd.DataFrame:
 
 @st.cache_data(show_spinner=False)
 def infer_types(df: pd.DataFrame) -> pd.DataFrame:
-    """Infer and cast types conservatively; do NOT drop any rows here."""
+    """Infer and cast types; create ActivityStartDateTime robustly without pandas internals."""
     df = df.copy()
 
-    # Trim whitespace in string-like columns
+    # Trim whitespace in strings
     for c in df.columns:
         if pd.api.types.is_object_dtype(df[c]) or pd.api.types.is_string_dtype(df[c]):
             df[c] = df[c].map(lambda x: x.strip() if isinstance(x, str) else x)
 
-    # Parse ActivityStartDate to datetime (date-only)
+    # Parse ActivityStartDate to date (no tz)
     if "ActivityStartDate" in df.columns:
-        df["ActivityStartDate"] = pd.to_datetime(df["ActivityStartDate"], errors="coerce").dt.date
+        ds = pd.to_datetime(df["ActivityStartDate"], errors="coerce")
+        df["ActivityStartDate"] = ds.dt.date
 
-    # Cast ResultMeasureValue to numeric
+    # Cast numeric
     if "ResultMeasureValue" in df.columns:
         df["ResultMeasureValue"] = pd.to_numeric(df["ResultMeasureValue"], errors="coerce")
 
-    # Parse time, combine with date and time zone if present
+    # Build ActivityStartDateTime if date AND time exist
     if "ActivityStartDate" in df.columns and "ActivityStartTime/Time" in df.columns:
-        # Parse time as string -> pandas time
-        t = pd.to_datetime(df["ActivityStartTime/Time"], errors="coerce").dt.time
+        # Parse time strings to "%H:%M:%S"; missing -> "00:00:00"
+        ts = pd.to_datetime(df["ActivityStartTime/Time"], errors="coerce")
+        time_str = ts.dt.strftime("%H:%M:%S").fillna("00:00:00")
 
-        # Build naive datetime from date + time
-        dt = pd.to_datetime(df["ActivityStartDate"], errors="coerce")
-        # If time is missing, leave as midnight
-        dt = dt.mask(dt.isna(), pd.NaT)
-        # Combine
-        dt_combined = pd.to_datetime(
-            dt.astype("datetime64[ns]").dt.strftime("%Y-%m-%d") + " " +
-            pd.Series([ti.strftime("%H:%M:%S") if isinstance(ti, pd._libs.tslibs.timestamps.Time) or hasattr(ti, "strftime") else ("00:00:00" if pd.notna(ti) else "00:00:00") for ti in t]),
-            errors="coerce"
-        )
+        # Construct a full datetime from date + time
+        date_str = pd.to_datetime(df["ActivityStartDate"], errors="coerce").dt.strftime("%Y-%m-%d")
+        dt_naive = pd.to_datetime(date_str + " " + time_str, errors="coerce")
 
-        # Localize with time zone code if present
+        # Timezone resolution: single uniform code -> use mapping; else UTC
+        tz = "UTC"
         if "ActivityStartTime/TimeZoneCode" in df.columns:
-            tz_codes = df["ActivityStartTime/TimeZoneCode"].fillna("UTC").astype(str)
-            # Best-effort per-row tz alignment (vectorized fallback to UTC)
-            # For simplicity & performance, map to a single tz if all the same; else default UTC
-            unique_tz = tz_codes.dropna().unique()
-            if len(unique_tz) == 1:
-                tz_code = unique_tz[0].strip()
-                tz = TZ_ABBREV_TO_IANA.get(tz_code, "UTC") if tz_code.upper() in TZ_ABBREV_TO_IANA else (tz_code if tz_code.startswith(("+", "-")) else "UTC")
-                try:
-                    dt_combined = dt_combined.dt.tz_localize(tz, nonexistent="shift_forward", ambiguous="NaT")
-                except Exception:
-                    dt_combined = dt_combined.dt.tz_localize("UTC", nonexistent="shift_forward", ambiguous="NaT")
-            else:
-                # Mixed tz codes -> keep UTC to avoid per-row tz churn
-                dt_combined = dt_combined.dt.tz_localize("UTC", nonexistent="shift_forward", ambiguous="NaT")
-        else:
-            # No tz column -> localize as UTC
-            dt_combined = dt_combined.dt.tz_localize("UTC", nonexistent="shift_forward", ambiguous="NaT")
+            tz_codes = df["ActivityStartTime/TimeZoneCode"].astype(str).str.strip().str.upper()
+            uniq = tz_codes.dropna().unique()
+            if len(uniq) == 1:
+                code = uniq[0]
+                if code in TZ_ABBREV_TO_IANA:
+                    tz = TZ_ABBREV_TO_IANA[code]
+                elif code.startswith(("+", "-")):
+                    tz = code  # pandas can localize fixed offsets like "+03:00"
+                else:
+                    tz = "UTC"
 
-        df["ActivityStartDateTime"] = dt_combined
+        try:
+            df["ActivityStartDateTime"] = dt_naive.dt.tz_localize(tz, nonexistent="shift_forward", ambiguous="NaT")
+        except Exception:
+            df["ActivityStartDateTime"] = dt_naive.dt.tz_localize("UTC", nonexistent="shift_forward", ambiguous="NaT")
 
     # Drop all-empty columns
     empty_cols = [c for c in df.columns if df[c].notna().sum() == 0]
@@ -281,7 +285,6 @@ def apply_filters(
     query = filters.get("text_query")
     search_cols = filters.get("text_cols", [])
     if query and search_cols:
-        # regex or contains selector
         regex = filters.get("text_is_regex", False)
         q = str(query)
         mask = pd.Series(False, index=df.index)
@@ -295,7 +298,6 @@ def apply_filters(
                         m = s.str.contains(q, regex=False, case=False, na=False)
                     mask = mask | m
                 except Exception:
-                    # Invalid regex -> fallback to plain contains
                     m = s.str.contains(q, regex=False, case=False, na=False)
                     mask = mask | m
         df = df[mask]
@@ -329,16 +331,14 @@ def build_workup(
 ) -> pd.DataFrame:
     """Create engineered columns and order them after original metadata."""
     df = df_clean_safe.copy()
-    # Recover original names for certain fields where needed
     colmap = df.attrs.get("colmap", {})
-    rmap = reverse_map(colmap) if colmap else {}
 
     # Uppercase unit code if present (safe name)
     unit_safe = safe_colname("ResultMeasure/MeasureUnitCode")
     if unit_safe in df.columns:
         df[unit_safe] = df[unit_safe].astype(str).str.upper()
 
-    # Build record_id from available keys (use SAFE names)
+    # Build record_id from available keys (SAFE names)
     key_candidates = [
         "MonitoringLocationIdentifier",
         "ActivityIdentifier",
@@ -349,7 +349,6 @@ def build_workup(
     if keys_present:
         df["record_id"] = df[keys_present].apply(stable_hash_row, axis=1)
     else:
-        # Fallback to hash of entire row (more expensive)
         df["record_id"] = df.apply(stable_hash_row, axis=1)
 
     # Column ordering: original ID/metadata -> result columns -> engineered
@@ -363,7 +362,6 @@ def build_workup(
         "SampleCollectionMethod/MethodName", "SampleCollectionEquipmentName",
         "ResultIdentifier", "CharacteristicName", "ResultSampleFractionText",
         "ResultStatusIdentifier", "ResultValueTypeName", "USGSPCode", "ProviderName",
-        # plus derived datetime if present
         "ActivityStartDateTime",
     ]
     result_cols = [
@@ -371,18 +369,14 @@ def build_workup(
     ]
     engineered = ["record_id"]
 
-    # Transform all to safe names for ordering
     id_meta_safe = [safe_colname(c) for c in id_meta if safe_colname(c) in df.columns]
     result_safe = [safe_colname(c) for c in result_cols if safe_colname(c) in df.columns]
     engineered_safe = [c for c in engineered if c in df.columns]
-
-    # Whatever remains
     remaining = [c for c in df.columns if c not in set(id_meta_safe + result_safe + engineered_safe)]
 
     ordered = id_meta_safe + result_safe + remaining + engineered_safe
     df = df.loc[:, ordered]
 
-    # Before returning workup for download we will revert to ORIGINAL column names where possible in the Downloads tab.
     df.attrs["colmap"] = colmap
     return df
 
@@ -390,27 +384,17 @@ def revert_to_original_cols(df_safe: pd.DataFrame) -> pd.DataFrame:
     """Map safe internal names back to original names for export."""
     colmap = df_safe.attrs.get("colmap", {})
     rmap = reverse_map(colmap) if colmap else {}
-    # Keep engineered columns (e.g., record_id) as-is
-    new_cols = [rmap.get(c, c) for c in df_safe.columns]
+    new_cols = [rmap.get(c, c) for c in df_safe.columns]  # keep engineered (e.g., record_id) as-is
     out = df_safe.copy()
     out.columns = new_cols
     return out
 
 # ----------------------------
-# UI Helpers
+# App
 # ----------------------------
 
 def kpi_card(label: str, value):
     st.metric(label, value if value is not None else "—")
-
-def warn_missing(*cols: str):
-    missing = [c for c in cols if c not in st.session_state["df_original"].columns]
-    if missing:
-        st.info(f"Note: missing column(s): {', '.join(missing)}")
-
-# ----------------------------
-# App
-# ----------------------------
 
 def main():
     st.title("USGS Water Quality Data — Filter • Clean • Analyze • Download")
@@ -420,7 +404,7 @@ def main():
         "Upload a .csv file (≤ ~200MB)",
         type=["csv"],
         accept_multiple_files=False,
-        help="Reads with UTF-8 and ignores errors; blank/NA/NaN treated as missing."
+        help="Reads with UTF-8; treats blank/NA/NaN as missing; skips bad lines."
     )
 
     # Initialize session state
@@ -433,9 +417,10 @@ def main():
 
     if not file:
         st.markdown("↖️ Upload a CSV to get started.")
-        st.caption("The app will automatically infer types, tolerate missing columns, and summarize schema.")
+        st.caption("The app will infer types, tolerate missing columns, and summarize schema.")
         return
 
+    # Read file
     try:
         df_raw = read_csv(file)
     except Exception as e:
@@ -446,11 +431,12 @@ def main():
     df_original = df_raw.copy()
     st.session_state["df_original"] = df_original
 
-    # Overview Tab
+    # Tabs
     tab_overview, tab_clean, tab_explore, tab_analysis, tab_downloads = st.tabs(
         ["Overview", "Cleaning", "Filter & Explore", "Analysis", "Downloads"]
     )
 
+    # ---------------- Overview ----------------
     with tab_overview:
         st.subheader("Quick Overview")
 
@@ -467,19 +453,20 @@ def main():
                 kpi_card("Date Range", "—")
 
         st.markdown("### Data Dictionary (present/missing, dtypes, % missing)")
-        st.dataframe(schema_summary(df_original), use_container_width=True, height=320)
+        show_df(schema_summary(df_original), 320)
 
         with st.expander("Peek at data (first 200 rows)", expanded=False):
-            st.dataframe(df_original.head(200), use_container_width=True, height=320)
+            show_df(df_original.head(200), 320)
 
+    # ---------------- Cleaning ----------------
     with tab_clean:
         st.subheader("Cleaning Options")
 
         st.write("Toggle cleaning options; a preview will appear below. Cleaning includes:")
         st.markdown(
-            "- Type casting for dates, times → `ActivityStartDateTime` (timezone-aware best-effort)\n"
+            "- Type casting for dates/times → `ActivityStartDateTime` (timezone-aware best-effort)\n"
             "- Numeric casting for `ResultMeasureValue`\n"
-            "- Column name standardization internally (kept original for export)\n"
+            "- Column name standardization internally (original names restored on export)\n"
             "- Dropping all-empty columns; trimming whitespace; de-duplicating\n"
             "- Optional row-drop by `ResultStatusIdentifier`"
         )
@@ -509,9 +496,8 @@ def main():
         df_clean_preview = revert_to_original_cols(df_clean_safe)
 
         st.markdown("### Cleaned Preview (first 200 rows)")
-        st.dataframe(df_clean_preview.head(200), use_container_width=True, height=320)
+        show_df(df_clean_preview.head(200), 320)
 
-        # Note about internal safe names
         with st.expander("Notes on internal columns"):
             st.caption(
                 "Internally, columns are lower-cased with spaces/slashes replaced. "
@@ -519,13 +505,13 @@ def main():
                 "Engineered columns like `record_id` remain in lowercase."
             )
 
+    # ---------------- Filter & Explore ----------------
     with tab_explore:
         st.subheader("Filter & Explore")
         df = df_original  # all filters are applied to ORIGINAL column names
 
         # Build filter widgets
         fc1, fc2, fc3, fc4, fc5 = st.columns(5)
-        # Helpers to get options
         def opts(col): return sorted(df[col].dropna().astype(str).unique().tolist()) if col in df.columns else []
 
         with fc1:
@@ -543,7 +529,11 @@ def main():
         if "ActivityStartDate" in df.columns and df["ActivityStartDate"].notna().any():
             dmin = pd.to_datetime(df["ActivityStartDate"], errors="coerce").min()
             dmax = pd.to_datetime(df["ActivityStartDate"], errors="coerce").max()
-            date_range = st.date_input("ActivityStartDate range", value=(dmin.date(), dmax.date()))
+            # Guard for empty/NaT
+            if pd.isna(dmin) or pd.isna(dmax):
+                date_range = None
+            else:
+                date_range = st.date_input("ActivityStartDate range", value=(dmin.date(), dmax.date()))
         else:
             date_range = None
             warn_missing("ActivityStartDate")
@@ -580,8 +570,9 @@ def main():
         st.success(f"Filtered rows: {len(df_filtered)} / {len(df_original)}")
 
         with st.expander("Preview filtered data (first 200 rows)", expanded=True):
-            st.dataframe(df_filtered.head(200), use_container_width=True, height=320)
+            show_df(df_filtered.head(200), 320)
 
+    # ---------------- Analysis ----------------
     with tab_analysis:
         st.subheader("Analysis")
 
@@ -591,10 +582,10 @@ def main():
         c1, c2 = st.columns(2)
         with c1:
             st.markdown("**Counts by CharacteristicName**")
-            st.dataframe(summarize_counts(dfA, "CharacteristicName"), use_container_width=True, height=280)
+            show_df(summarize_counts(dfA, "CharacteristicName"), 280)
         with c2:
             st.markdown("**Counts by MonitoringLocationIdentifier**")
-            st.dataframe(summarize_counts(dfA, "MonitoringLocationIdentifier"), use_container_width=True, height=280)
+            show_df(summarize_counts(dfA, "MonitoringLocationIdentifier"), 280)
 
         st.markdown("---")
         st.markdown("### Aggregations for ResultMeasureValue")
@@ -608,7 +599,7 @@ def main():
             warn_missing("ResultMeasureValue")
             st.info("No aggregation available with current data/filters.")
         else:
-            st.dataframe(agg_tbl, use_container_width=True, height=340)
+            show_df(agg_tbl, 340)
 
         st.markdown("---")
         st.markdown("### Visuals (optional)")
@@ -638,14 +629,13 @@ def main():
                 st.info("Boxplot unavailable (needs CharacteristicName & ResultMeasureValue).")
 
         with v3:
-            # Time series median by week or month if datetime exists
+            # Time series median by month if datetime exists
             dt_col = None
             for c in ["ActivityStartDateTime"]:
                 if c in dfA.columns:
                     dt_col = c
                     break
             if dt_col is None and "ActivityStartDate" in dfA.columns:
-                # Build a naive datetime from date for simple grouping
                 dfA = dfA.copy()
                 dfA["__dt"] = pd.to_datetime(dfA["ActivityStartDate"], errors="coerce")
                 dt_col = "__dt"
@@ -664,6 +654,7 @@ def main():
             else:
                 st.info("Time series unavailable (needs date/time and ResultMeasureValue).")
 
+    # ---------------- Downloads ----------------
     with tab_downloads:
         st.subheader("Downloads (CSV, UTF-8, no index)")
 
@@ -720,7 +711,7 @@ def main():
             "If some requested operation requires a missing column, the app adds a gentle warning and continues."
         )
 
-    # Gentle helpful notes
+    # Helpful notes
     with st.sidebar.expander("Tips"):
         st.caption(
             "- Use **Filter & Explore** to narrow the dataset before charts.\n"
