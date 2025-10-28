@@ -92,16 +92,20 @@ def has_cols(df: pd.DataFrame, cols: List[str]) -> bool:
 
 @st.cache_data(show_spinner=False)
 def read_csv(file: io.BytesIO) -> pd.DataFrame:
-    """Robust CSV reader for up to ~200MB with gentle options."""
-    return pd.read_csv(
-        file,
+    """Robust CSV reader for up to ~200MB with graceful compatibility across pandas versions."""
+    common = dict(
         encoding="utf-8",
-        errors="ignore",
         na_values=["", "NA", "NaN"],
         low_memory=False,
-        on_bad_lines="skip",
+        on_bad_lines="skip",   # requires engine="python"
         engine="python",
     )
+    # Newer pandas (>=1.4/2.x) supports encoding_errors
+    try:
+        return pd.read_csv(file, encoding_errors="ignore", **common)
+    except TypeError:
+        # Older pandas: no encoding_errors param available
+        return pd.read_csv(file, **common)
 
 @st.cache_data(show_spinner=False)
 def schema_summary(df: pd.DataFrame) -> pd.DataFrame:
