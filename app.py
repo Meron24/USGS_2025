@@ -70,7 +70,7 @@ def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
     new_cols = {}
     for c in df.columns:
         canon = lower_to_canon.get(c.lower())
-        new_cols[c] = canon if canon else c  # keep original if not known
+        new_cols[c] = canon if canon else c
     df = df.rename(columns=new_cols)
     return df
 
@@ -88,14 +88,12 @@ def move_geo_next_to_location(df: pd.DataFrame) -> pd.DataFrame:
     for c in cols:
         if c == "MonitoringLocationIdentifier":
             left.append(c)
-            # insert geo columns right after, if they exist
             if "LatitudeMeasure" in cols:
                 left.append("LatitudeMeasure")
             if "LongitudeMeasure" in cols:
                 left.append("LongitudeMeasure")
             after_inserted = True
         else:
-            # avoid duplicating geo columns
             if after_inserted and c in ("LatitudeMeasure", "LongitudeMeasure"):
                 continue
             right.append(c)
@@ -118,9 +116,6 @@ def coerce_result_value_numeric(df: pd.DataFrame) -> pd.DataFrame:
     bad_tokens = {"", "nan", "none", "null", "na", "00000000"}
     s = s.mask(s.str.lower().isin(bad_tokens))
 
-    # Optional: sometimes zeros are true zeros; the specific '00000000' often indicates missing in some exports
-    # If you wish to keep literal zeros, remove '00000000' from bad_tokens above and let it coerce to 0.0.
-
     # Coerce to numeric
     df[NUMCOL] = pd.to_numeric(s, errors="coerce")
     return df
@@ -135,7 +130,6 @@ def build_datetime_helper(df: pd.DataFrame) -> pd.DataFrame:
     if "ActivityStartDateTime" in df.columns:
         df[DT_HELPER] = pd.to_datetime(df["ActivityStartDateTime"], errors="coerce", utc=False)
     elif "ActivityStartDate" in df.columns:
-        # Many WQX CSVs have m/d/Y or Y-m-d; let pandas guess
         df[DT_HELPER] = pd.to_datetime(df["ActivityStartDate"], errors="coerce", utc=False, infer_datetime_format=True)
     return df
 
@@ -220,12 +214,14 @@ def sidebar_about():
 
 def sidebar_controls():
     st.sidebar.header("1) Upload CSV")
-    file = st.sidebar.file_uploader("Choose a CSV file", type=["csv"])
+    file = st.sidebar.file_uploader("Choose a CSV file", type=["csv"], key="upl_csv")
     st.sidebar.divider()
 
     st.sidebar.header("2) Cleaning Options")
-    drop_usgs_only = st.sidebar.checkbox("Keep only USGS/NWIS rows", value=True)
-    reorder_geo = st.sidebar.checkbox("Place Latitude/Longitude after MonitoringLocationIdentifier", value=True)
+    drop_usgs_only = st.sidebar.checkbox("Keep only USGS/NWIS rows", value=True, key="opt_usgs_only")
+    reorder_geo = st.sidebar.checkbox(
+        "Place Latitude/Longitude after MonitoringLocationIdentifier", value=True, key="opt_reorder_geo"
+    )
     st.sidebar.divider()
 
     st.sidebar.header("3) Filters")
@@ -243,7 +239,10 @@ def render_data_tab(df: pd.DataFrame):
     with c2:
         st.metric("Columns", f"{df.shape[1]:,}")
     with c3:
-        st.metric("Non-null in ResultMeasureValue", f"{df['ResultMeasureValue'].notna().sum():,}" if "ResultMeasureValue" in df.columns else "n/a")
+        st.metric(
+            "Non-null in ResultMeasureValue",
+            f"{df['ResultMeasureValue'].notna().sum():,}" if "ResultMeasureValue" in df.columns else "n/a",
+        )
 
     with st.expander("Show all columns"):
         st.write(list(df.columns))
@@ -259,6 +258,7 @@ def render_downloads(df_clean: pd.DataFrame, df_filtered: pd.DataFrame):
             file_name="cleaned_usgs_water_quality.csv",
             mime="text/csv",
             use_container_width=True,
+            key="dl_clean",
         )
     with c2:
         st.download_button(
@@ -267,12 +267,14 @@ def render_downloads(df_clean: pd.DataFrame, df_filtered: pd.DataFrame):
             file_name="filtered_usgs_water_quality.csv",
             mime="text/csv",
             use_container_width=True,
+            key="dl_filtered",
         )
 
 
-def render_filters(df: pd.DataFrame) -> pd.DataFrame:
+def render_filters(df: pd.DataFrame, key_prefix: str = "filters") -> pd.DataFrame:
     """
     Simple filter UI for common columns. Returns the filtered DataFrame.
+    Each widget has a unique key using key_prefix to avoid StreamlitDuplicateElementId.
     """
     dfF = df.copy()
 
@@ -282,29 +284,36 @@ def render_filters(df: pd.DataFrame) -> pd.DataFrame:
         # CharacteristicName
         if "CharacteristicName" in cols:
             vals = sorted(dfF["CharacteristicName"].dropna().astype(str).unique().tolist())
-            chosen = st.multiselect("CharacteristicName", vals, default=[])
+            chosen = st.multiselect(
+                "CharacteristicName", vals, default=[], key=f"{key_prefix}_charname"
+            )
             if chosen:
                 dfF = dfF[dfF["CharacteristicName"].astype(str).isin(chosen)]
 
         # ResultSampleFractionText
         if "ResultSampleFractionText" in cols:
             vals = sorted(dfF["ResultSampleFractionText"].dropna().astype(str).unique().tolist())
-            chosen = st.multiselect("ResultSampleFractionText", vals, default=[])
+            chosen = st.multiselect(
+                "ResultSampleFractionText", vals, default=[], key=f"{key_prefix}_fraction"
+            )
             if chosen:
                 dfF = dfF[dfF["ResultSampleFractionText"].astype(str).isin(chosen)]
 
         # Unit filter
         if "ResultMeasure/MeasureUnitCode" in cols:
             vals = sorted(dfF["ResultMeasure/MeasureUnitCode"].dropna().astype(str).unique().tolist())
-            chosen = st.multiselect("ResultMeasure/MeasureUnitCode", vals, default=[])
+            chosen = st.multiselect(
+                "ResultMeasure/MeasureUnitCode", vals, default=[], key=f"{key_prefix}_unit"
+            )
             if chosen:
                 dfF = dfF[dfF["ResultMeasure/MeasureUnitCode"].astype(str).isin(chosen)]
 
         # Site filter
         if "MonitoringLocationIdentifier" in cols:
-            # Limit the checklist for performance by top N frequent
             top_sites = dfF["MonitoringLocationIdentifier"].value_counts().head(200).index.tolist()
-            chosen = st.multiselect("MonitoringLocationIdentifier (Top 200)", top_sites, default=[])
+            chosen = st.multiselect(
+                "MonitoringLocationIdentifier (Top 200)", top_sites, default=[], key=f"{key_prefix}_site"
+            )
             if chosen:
                 dfF = dfF[dfF["MonitoringLocationIdentifier"].isin(chosen)]
 
@@ -315,9 +324,13 @@ def render_filters(df: pd.DataFrame) -> pd.DataFrame:
             st.write("Date range filter (based on ActivityStartDate/ActivityStartDateTime):")
             d1, d2 = st.columns(2)
             with d1:
-                start_date = st.date_input("Start date", value=min_dt.date() if pd.notna(min_dt) else None)
+                start_date = st.date_input(
+                    "Start date", value=min_dt.date() if pd.notna(min_dt) else None, key=f"{key_prefix}_start"
+                )
             with d2:
-                end_date = st.date_input("End date", value=max_dt.date() if pd.notna(max_dt) else None)
+                end_date = st.date_input(
+                    "End date", value=max_dt.date() if pd.notna(max_dt) else None, key=f"{key_prefix}_end"
+                )
 
             if start_date and end_date:
                 m1 = pd.to_datetime(start_date)
@@ -325,7 +338,7 @@ def render_filters(df: pd.DataFrame) -> pd.DataFrame:
                 mask = (dfF[DT_HELPER] >= m1) & (dfF[DT_HELPER] < m2)
                 dfF = dfF[mask]
 
-    st.success(f"Filtered rows: {len(dfF):,}")
+    st.success(f"Filtered rows: {len(dfF):,}", icon="✅")
     return dfF
 
 
@@ -337,6 +350,7 @@ def render_analysis_tab(dfA: pd.DataFrame):
         options=[c for c in DEFAULT_GROUPS if c in dfA.columns],
         default=[c for c in DEFAULT_GROUPS if c in dfA.columns][:2],
         max_selections=3,
+        key="analysis_dims",
     )
 
     agg_tbl = summarize_aggregations(dfA, NUMCOL, dims)
@@ -350,33 +364,43 @@ def render_analysis_tab(dfA: pd.DataFrame):
     # Histogram of ResultMeasureValue (numeric mirror)
     if NUMCOL in dfA.columns and dfA[NUMCOL].notna().any():
         v = dfA[NUMCOL].dropna()
-        if st.checkbox("Histogram of ResultMeasureValue", value=True):
-            fig = px.histogram(v.to_frame(name="ResultMeasureValue"), x="ResultMeasureValue", nbins=50,
-                               title="Histogram of ResultMeasureValue")
+        if st.checkbox("Histogram of ResultMeasureValue", value=True, key="hist_checkbox"):
+            fig = px.histogram(
+                v.to_frame(name="ResultMeasureValue"),
+                x="ResultMeasureValue",
+                nbins=50,
+                title="Histogram of ResultMeasureValue",
+            )
             st.plotly_chart(fig, use_container_width=True)
 
     # Boxplot by CharacteristicName (top N)
     if {"CharacteristicName", NUMCOL}.issubset(dfA.columns):
-        if st.checkbox("Boxplot by CharacteristicName (Top 10)", value=False):
+        if st.checkbox("Boxplot by CharacteristicName (Top 10)", value=False, key="box_checkbox"):
             sub = dfA.dropna(subset=[NUMCOL, "CharacteristicName"]).copy()
             if not sub.empty:
                 top = sub["CharacteristicName"].value_counts().head(10).index
                 sub = sub[sub["CharacteristicName"].isin(top)]
                 if not sub.empty:
-                    fig = px.box(sub, x="CharacteristicName", y=NUMCOL, points="outliers",
-                                 title="ResultMeasureValue by CharacteristicName (Top 10)")
+                    fig = px.box(
+                        sub,
+                        x="CharacteristicName",
+                        y=NUMCOL,
+                        points="outliers",
+                        title="ResultMeasureValue by CharacteristicName (Top 10)",
+                    )
                     st.plotly_chart(fig, use_container_width=True)
 
     # Monthly median time-series
     if DT_HELPER in dfA.columns and NUMCOL in dfA.columns:
-        if st.checkbox("Time series (monthly median of ResultMeasureValue)", value=False):
+        if st.checkbox("Time series (monthly median of ResultMeasureValue)", value=False, key="ts_checkbox"):
             ts = dfA[[DT_HELPER, NUMCOL]].dropna().copy()
             if not ts.empty:
                 ts["_period"] = pd.to_datetime(ts[DT_HELPER], errors="coerce").dt.to_period("M").dt.to_timestamp()
                 grp = ts.groupby("_period")[NUMCOL].median().reset_index()
                 if not grp.empty:
-                    fig = px.line(grp, x="_period", y=NUMCOL, markers=True,
-                                  title="Monthly Median of ResultMeasureValue")
+                    fig = px.line(
+                        grp, x="_period", y=NUMCOL, markers=True, title="Monthly Median of ResultMeasureValue"
+                    )
                     st.plotly_chart(fig, use_container_width=True)
 
 
@@ -425,23 +449,25 @@ def main():
         st.caption("Note: Internal numeric mirror column used for analysis: `__RMV` (not exported).")
 
     with tab2:
-        df_filtered = render_filters(df_clean)
-        render_analysis_tab(df_filtered)
+        # Filters for the Analysis tab (unique widget keys)
+        df_filtered_analysis = render_filters(df_clean, key_prefix="analysis_filters")
+        render_analysis_tab(df_filtered_analysis)
 
     with tab3:
-        # Ensure filtered reflects what's in Analysis tab
-        df_filtered = render_filters(df_clean)
+        # Separate filter set for the Export tab (unique widget keys)
+        df_filtered_export = render_filters(df_clean, key_prefix="export_filters")
+
         # Do not export internal helper columns
         drop_cols_on_export = [NUMCOL, DT_HELPER]
         export_clean = df_clean.drop(columns=[c for c in drop_cols_on_export if c in df_clean.columns], errors="ignore")
-        export_filtered = df_filtered.drop(columns=[c for c in drop_cols_on_export if c in df_filtered.columns], errors="ignore")
+        export_filtered = df_filtered_export.drop(
+            columns=[c for c in drop_cols_on_export if c in df_filtered_export.columns], errors="ignore"
+        )
 
         render_downloads(export_clean, export_filtered)
 
         st.markdown("#### Notes")
-        st.markdown(
-            "- Cleaned CSV preserves your original columns, except we may reorder Latitude/Longitude."
-        )
+        st.markdown("- Cleaned CSV preserves your original columns, except we may reorder Latitude/Longitude.")
         st.markdown(
             "- Analysis uses a safe numeric mirror of `ResultMeasureValue` (`__RMV`) to avoid dtype errors (e.g., `'00000000'` or scientific-notation strings)."
         )
